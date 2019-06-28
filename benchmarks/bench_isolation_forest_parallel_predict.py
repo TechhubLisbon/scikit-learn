@@ -3,6 +3,7 @@ from time import time
 import numpy as np
 import pandas as pd
 from sklearn.ensemble.iforest import IsolationForest, _average_path_length
+from sklearn.ensemble.base import _partition_estimators
 
 
 class ParallelPredIsolationForest(IsolationForest):
@@ -30,28 +31,36 @@ class ParallelPredIsolationForest(IsolationForest):
         ndarray
             The anomaly scores for each sample
         """
+        def get_depths(X, trees, trees_features, subsample_features):
+            n = X.shape[0]
+            batch_depths = np.zeros(n, order="f")
 
-        def get_score(_X, _tree, _features, _subsample_features):
-            X_subset = _X[:, _features] if _subsample_features else _X
+            for tree, features in zip(trees, trees_features):
+                X_subset = X[:, features] if subsample_features else X
 
-            leaves_index = _tree.apply(X_subset)
-            node_indicator = _tree.decision_path(X_subset)
-            n_samples_leaf = _tree.tree_.n_node_samples[leaves_index]
+                leaves_index = tree.apply(X_subset)
+                node_indicator = tree.decision_path(X_subset)
+                n_samples_leaf = tree.tree_.n_node_samples[leaves_index]
 
-            return np.ravel(node_indicator.sum(axis=1)) + _average_path_length(
-                n_samples_leaf) - 1.0
+                batch_depths += np.ravel(node_indicator.sum(axis=1)) \
+                    + _average_path_length(n_samples_leaf) - 1.0
+
+            return batch_depths
+
+        n_jobs, n_estimators, starts = _partition_estimators(
+            self.n_estimators, self.n_jobs)
+
+        par_exec = Parallel(n_jobs=n_jobs, **self._parallel_args())
+        par_results = par_exec(
+            delayed(get_depths)(
+                X=X, trees=self.estimators_[starts[i]: starts[i + 1]],
+                trees_features=self.estimators_features_[
+                               starts[i]: starts[i + 1]],
+                subsample_features=subsample_features)
+            for i in range(n_jobs))
 
         n_samples = X.shape[0]
-
         depths = np.zeros(n_samples, order="f")
-
-        par_exec = Parallel(n_jobs=self.n_jobs, prefer="threads",
-                            require='sharedmem')
-        par_results = par_exec(
-            delayed(get_score)(_X=X, _tree=tree, _features=features,
-                               _subsample_features=subsample_features)
-            for tree, features in zip(self.estimators_,
-                                      self.estimators_features_))
 
         for result in par_results:
             depths += result
