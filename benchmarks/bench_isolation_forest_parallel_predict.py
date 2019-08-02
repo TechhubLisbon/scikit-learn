@@ -1,9 +1,13 @@
+from distutils.version import LooseVersion
+
+import joblib
 from joblib import Parallel, delayed
 from time import time
 import numpy as np
 import pandas as pd
 from sklearn.ensemble.iforest import IsolationForest, _average_path_length
 from sklearn.ensemble.base import _partition_estimators
+from tqdm import tqdm
 
 
 class ParallelPredIsolationForest(IsolationForest):
@@ -31,12 +35,12 @@ class ParallelPredIsolationForest(IsolationForest):
         ndarray
             The anomaly scores for each sample
         """
-        def get_depths(X, trees, trees_features, subsample_features):
-            n = X.shape[0]
+        def get_depths(_X, trees, trees_features, _subsample_features):
+            n = _X.shape[0]
             batch_depths = np.zeros(n, order="f")
 
             for tree, features in zip(trees, trees_features):
-                X_subset = X[:, features] if subsample_features else X
+                X_subset = _X[:, features] if _subsample_features else _X
 
                 leaves_index = tree.apply(X_subset)
                 node_indicator = tree.decision_path(X_subset)
@@ -50,20 +54,19 @@ class ParallelPredIsolationForest(IsolationForest):
         n_jobs, n_estimators, starts = _partition_estimators(
             self.n_estimators, self.n_jobs)
 
+        old_joblib = LooseVersion(joblib.__version__) < LooseVersion('0.12')
+        check_pickle = False if old_joblib else None
+
         par_exec = Parallel(n_jobs=n_jobs, **self._parallel_args())
         par_results = par_exec(
-            delayed(get_depths)(
-                X=X, trees=self.estimators_[starts[i]: starts[i + 1]],
+            delayed(get_depths, check_pickle=check_pickle)(
+                _X=X, trees=self.estimators_[starts[i]: starts[i + 1]],
                 trees_features=self.estimators_features_[
                                starts[i]: starts[i + 1]],
-                subsample_features=subsample_features)
+                _subsample_features=subsample_features)
             for i in range(n_jobs))
 
-        n_samples = X.shape[0]
-        depths = np.zeros(n_samples, order="f")
-
-        for result in par_results:
-            depths += result
+        depths = np.sum(par_results, axis=0)
 
         scores = 2 ** (-depths / (len(self.estimators_)
                                   * _average_path_length([self.max_samples_])))
@@ -195,5 +198,58 @@ def test_n_trees(n_trees_list, n_jobs_list, n_features=30, repetitions=5,
         results_parallel_iforest, index=n_trees_list, columns=n_jobs_list)
     speed_up = pd.DataFrame(
         speed_up, index=n_trees_list, columns=n_jobs_list)
+
+    return results_sklearn_iforest, results_parallel_iforest, speed_up
+
+
+def test_n_rows_n_features(n_samples_list, n_features_list, n_jobs,
+                           repetitions=5, n_trees=100):
+    assert isinstance(n_samples_list, list)
+    assert isinstance(n_features_list, list)
+    assert isinstance(n_trees, int)
+    assert isinstance(n_jobs, int)
+    assert isinstance(repetitions, int)
+
+    results_sklearn_iforest = np.zeros((len(n_samples_list),
+                                        len(n_features_list)))
+    results_parallel_iforest = np.zeros((len(n_samples_list),
+                                         len(n_features_list)))
+
+    for i, n_samples in tqdm(enumerate(n_samples_list)):
+        for j, n_features in enumerate(n_features_list):
+            X_train, X_test = get_data(n_samples_train=n_samples,
+                                       n_samples_test=n_samples,
+                                       n_features=n_features)
+
+            for _ in range(repetitions):
+                # Test current Isolation Forest
+                iforest = IsolationForest(n_estimators=n_trees, n_jobs=n_jobs,
+                                          random_state=i)
+                iforest.fit(X_train)
+                start = time()
+                _ = iforest.predict(X_test)
+                results_sklearn_iforest[i, j] += time() - start
+
+                # Test PR Isolation Forest
+                iforest = ParallelPredIsolationForest(
+                    n_estimators=n_trees, n_jobs=n_jobs, random_state=i)
+                iforest.fit(X_train)
+                start = time()
+                _ = iforest.predict(X_test)
+                results_parallel_iforest[i, j] += time() - start
+
+            results_sklearn_iforest[i, j] /= repetitions
+            results_parallel_iforest[i, j] /= repetitions
+
+    speed_up = results_sklearn_iforest / results_parallel_iforest
+
+    results_sklearn_iforest = pd.DataFrame(
+        results_sklearn_iforest, index=n_samples_list,
+        columns=n_features_list)
+    results_parallel_iforest = pd.DataFrame(
+        results_parallel_iforest, index=n_samples_list,
+        columns=n_features_list)
+    speed_up = pd.DataFrame(
+        speed_up, index=n_samples_list, columns=n_features_list)
 
     return results_sklearn_iforest, results_parallel_iforest, speed_up
